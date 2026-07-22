@@ -1,0 +1,26 @@
+[
+  {
+    "record_id": "Cu2O_Cu_Kedge_aaaaaanx",
+    "material_formula": "Cu2O",
+    "mp_id": "aaaaaanx",
+    "is_highlighted": true
+  },
+  {
+    "record_id": "Fe2O3_Fe_Kedge_aaaabkym",
+    "material_formula": "Fe2O3",
+    "mp_id": "aaaabkym",
+    "is_highlighted": true
+  },
+  {
+    "record_id": "TiO2_Ti_Kedge_aaaaaapa",
+    "material_formula": "TiO2",
+    "mp_id": "aaaaaapa",
+    "is_highlighted": true
+  },
+  {
+    "record_id": "CeO2_Ce_Kedge_aaaabdws",
+    "material_formula": "CeO2",
+    "mp_id": "aaaabdws",
+    "is_highlighted": true
+  }
+]

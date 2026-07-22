@@ -13,14 +13,31 @@ pymatgen knows about, restricted to binary M-O compounds.
 
 IMPORTANT -- what this data is and isn't:
     These spectra are AB INITIO COMPUTED (FEFF real-space Green's-function
-    multiple-scattering theory), NOT experimentally measured. See README.md
-    for the underlying theory. Every record is tagged source_type =
-    "computed-database" so nothing downstream can mistake it for
-    experimental data.
+    multiple-scattering theory), NOT experimentally measured. Every record
+    is tagged source_type = "computed-database".
+
+VERIFIED so far against a live MP_API_KEY run (2026-07-22):
+    - Identifier field on returned mp-api objects is `task_id`, not
+      `material_id`.
+    - `r.spectrum` exposes `.x` / `.y` list attributes directly (confirmed
+      live -- not a dict).
+    - A single formula/element/edge query can return MULTIPLE spectrum_type
+      values (XANES / XAFS / EXAFS) for the SAME material (same task_id).
+      This script now explicitly filters to spectrum_type == "XANES" --
+      earlier versions relied on results[0] happening to be the narrow
+      entry, which worked by luck for all four V1 materials but was not a
+      real filter.
+    - CeO2's computed K-edge onset is ~50 eV above the tabulated
+      experimental Ce K-edge (see KNOWN_CAVEATS below) -- this is
+      reproducible across 3 independent FEFF computations for that
+      material, but the cause has NOT been confirmed against FEFF's own
+      documentation (which describes normal Fermi-level referencing error
+      as "only a few eV," not ~50). Treat as an open question, not a
+      solved one -- do not apply an unverified correction shift.
 
 Requires:
-    pip install mp-api pymatgen --break-system-packages
-    export MP_API_KEY=your_key_here   (free key: https://next-gen.materialsproject.org/api)
+    pip install mp-api pymatgen
+    $env:MP_API_KEY="your_key_here"   (free key: https://next-gen.materialsproject.org/api)
 
 Usage:
     python src/mp_xanes_fetch.py                  # highlighted 4 only (fast, default)
@@ -35,12 +52,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List
 
-# ---------------------------------------------------------------------------
-# The four materials this portfolio already models elsewhere (MPExplorer,
-# CatalystML, MieCatalystML). Always fetched first, always flagged
-# is_highlighted=True. This is curation, not the scope limit -- the scope
-# limit is controlled by --mode.
-# ---------------------------------------------------------------------------
 HIGHLIGHTED_MATERIALS = {
     "Cu2O": "Cu",
     "Fe2O3": "Fe",
@@ -48,15 +59,28 @@ HIGHLIGHTED_MATERIALS = {
     "CeO2": "Ce",
 }
 
-# Tie-break hints only -- used to pick a specific polymorph when a formula
-# query returns more than one match. NOT the sole source of truth (the
-# script always queries live). mp-2657 (rutile TiO2) was not independently
-# search-verified the way the other three were -- flagged here on purpose.
 PREFERRED_MP_ID_HINTS = {
-    "Cu2O": "mp-361",      # cuprite, cubic Pn-3m -- verified
-    "Fe2O3": "mp-19770",   # hematite, trigonal R-3c -- verified
-    "TiO2": "mp-2657",     # rutile -- UNVERIFIED, sanity-check before trusting
-    "CeO2": "mp-20194",    # fluorite, cubic Fm-3m -- verified
+    "Cu2O": "mp-361",
+    "Fe2O3": "mp-19770",
+    "TiO2": "mp-2657",     # unverified tie-break hint
+    "CeO2": "mp-20194",
+}
+
+# Data-quality caveats that get folded directly into a record's `notes`
+# field -- travels with the data itself, not just documented in README.
+KNOWN_CAVEATS = {
+    "CeO2": (
+        "Computed K-edge onset sits ~50 eV above the tabulated experimental "
+        "Ce K-edge (40443 eV) -- larger than FEFF's own documented typical "
+        "Fermi-level referencing error ('only a few eV', per the FEFF9 "
+        "user's guide, feffproject.org). Cause unconfirmed as of 2026-07-22. "
+        "The offset is consistent across 3 independent FEFF computations "
+        "(XANES/XAFS/EXAFS spectrum_type) for the same mp-id, so it is "
+        "treated as a genuine feature of this database entry, not a "
+        "fetch/parsing error -- but no verified mechanistic explanation has "
+        "been established. Do not apply an ad hoc energy-shift correction "
+        "without independent justification."
+    ),
 }
 
 
@@ -73,6 +97,10 @@ class XANESRecord:
     notes: str = "Ab initio computed spectrum, not an experimental measurement."
 
     def to_schema_record(self) -> dict:
+        notes = self.notes
+        caveat = KNOWN_CAVEATS.get(self.material_formula)
+        if caveat:
+            notes = f"{notes} CAVEAT: {caveat}"
         return {
             "record_id": f"{self.material_formula}_{self.absorbing_element}_{self.edge}edge_{self.mp_id}",
             "material_formula": self.material_formula,
@@ -87,14 +115,13 @@ class XANESRecord:
             "source_type": "computed-database",
             "citation": (
                 "Materials Project FEFF XAS database; Zheng, C. et al. "
-                "'Automated generation and ensemble-learned matching of "
-                "X-ray absorption spectra.' Sci. Data 5, 180151 (2018)."
+                "Sci. Data 5, 180151 (2018)."
             ),
             "license": "CC-BY-4.0",
             "digitization_error_estimate": None,
             "linked_properties": {"is_highlighted": self.is_highlighted},
             "retrieved_at_utc": self.retrieved_at_utc,
-            "notes": self.notes,
+            "notes": notes,
         }
 
 
@@ -110,9 +137,24 @@ def _get_client(api_key: Optional[str] = None):
 
 
 def _spectrum_arrays(spectrum):
+    if isinstance(spectrum, dict):
+        return list(spectrum.get("x", [])), list(spectrum.get("y", []))
     energy = list(getattr(spectrum, "x", spectrum[0] if isinstance(spectrum, (list, tuple)) else []))
     absorption = list(getattr(spectrum, "y", spectrum[1] if isinstance(spectrum, (list, tuple)) else []))
     return energy, absorption
+
+
+def _filter_xanes(results, formula):
+    """Explicit spectrum_type filter -- a single query can return XANES,
+    XAFS, and EXAFS entries for the same material. Earlier versions of this
+    script took results[0] and got the right one by luck; this is the real
+    fix."""
+    xanes = [r for r in results if getattr(r, "spectrum_type", None) == "XANES"]
+    if not xanes:
+        found_types = sorted({str(getattr(r, "spectrum_type", None)) for r in results})
+        print(f"  [WARN] {formula}: {len(results)} XAS entries found but none are "
+              f"spectrum_type=='XANES' (found: {found_types}). Skipping.")
+    return xanes
 
 
 def fetch_highlighted(mpr) -> List[XANESRecord]:
@@ -126,33 +168,34 @@ def fetch_highlighted(mpr) -> List[XANESRecord]:
             print(f"  [ERROR] {exc}")
             continue
         if not results:
-            print(f"  [WARN] No XANES K-edge data found for {formula}.")
+            print(f"  [WARN] No XAS data found for {formula}.")
+            continue
+        results = _filter_xanes(results, formula)
+        if not results:
             continue
         hint = PREFERRED_MP_ID_HINTS.get(formula)
-        chosen = next((r for r in results if str(r.material_id) == hint), None) if hint else None
+        chosen = next((r for r in results if str(r.task_id) == hint), None) if hint else None
         if chosen is None:
             chosen = results[0]
             if len(results) > 1:
-                print(f"  [INFO] {len(results)} matches for {formula}; using mp-id={chosen.material_id} "
+                print(f"  [INFO] {len(results)} XANES matches for {formula}; using mp-id={chosen.task_id} "
                       f"(no exact hint match).")
         energy, absorption = _spectrum_arrays(chosen.spectrum)
         if not energy or not absorption:
-            print(f"  [WARN] {formula}: mp-id={chosen.material_id} had empty spectrum arrays.")
+            print(f"  [WARN] {formula}: mp-id={chosen.task_id} had empty spectrum arrays.")
             continue
         records.append(XANESRecord(
-            material_formula=formula, mp_id=str(chosen.material_id),
+            material_formula=formula, mp_id=str(chosen.task_id),
             absorbing_element=elem, edge="K",
             energy_ev=energy, normalized_absorption=absorption,
             is_highlighted=True,
         ))
-        print(f"  Got mp-id={chosen.material_id}, {len(energy)} points")
+        print(f"  Got mp-id={chosen.task_id}, {len(energy)} points, "
+              f"energy range [{min(energy):.1f}, {max(energy):.1f}] eV")
     return records
 
 
 def discover_all_metals() -> List[str]:
-    """Every metal element pymatgen's periodic table knows about -- not a
-    hand-typed list, so 'all metal oxides' actually means all of them, not
-    whatever set of metals I happened to remember."""
     from pymatgen.core.periodic_table import Element
     return sorted({el.symbol for el in Element if el.is_metal})
 
@@ -172,13 +215,11 @@ def fetch_all_metal_oxides(mpr, already_fetched_ids: set) -> List[XANESRecord]:
             continue
         if not results:
             continue
+        results = _filter_xanes(results, f"{metal}-O")
         found_here = 0
         for r in results:
-            if str(r.material_id) in already_fetched_ids:
+            if str(r.task_id) in already_fetched_ids:
                 continue
-            # Restrict to binary M-O compounds where that attribute is
-            # available; if the API doesn't expose it on this object, don't
-            # silently over-filter -- keep the result and let it through.
             els = getattr(r, "elements", None)
             if els is not None:
                 symbols = {str(e) for e in els}
@@ -189,12 +230,12 @@ def fetch_all_metal_oxides(mpr, already_fetched_ids: set) -> List[XANESRecord]:
                 continue
             records.append(XANESRecord(
                 material_formula=str(getattr(r, "formula_pretty", f"{metal}xOy")),
-                mp_id=str(r.material_id),
+                mp_id=str(r.task_id),
                 absorbing_element=metal, edge="K",
                 energy_ev=energy, normalized_absorption=absorption,
                 is_highlighted=False,
             ))
-            already_fetched_ids.add(str(r.material_id))
+            already_fetched_ids.add(str(r.task_id))
             found_here += 1
         if found_here:
             print(f"  +{found_here} binary {metal}-O XANES record(s)")
@@ -203,9 +244,7 @@ def fetch_all_metal_oxides(mpr, already_fetched_ids: set) -> List[XANESRecord]:
 
 def main():
     parser = argparse.ArgumentParser(description="Fetch FEFF-computed XANES for metal oxides from Materials Project.")
-    parser.add_argument("--mode", choices=["highlighted", "all"], default="highlighted",
-                         help="'highlighted' = just Cu2O/Fe2O3/TiO2/CeO2 (fast, default). "
-                              "'all' = every metal oxide MP has XANES for (slow, many API calls).")
+    parser.add_argument("--mode", choices=["highlighted", "all"], default="highlighted")
     parser.add_argument("--out", default="data/xanes")
     parser.add_argument("--api-key", default=None)
     args = parser.parse_args()
