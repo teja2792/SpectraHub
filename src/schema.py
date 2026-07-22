@@ -1,9 +1,10 @@
 """
 schema.py
 
-Canonical spectral-record schema for SpectraHub. V1 only populates the
-"XANES" modality, but the schema covers the full set of modalities in the
-original project scope so later phases add data, not a new schema.
+Canonical spectral-record schema for SpectraHub. Currently populated
+modalities: XANES, XAFS, EXAFS (see mp_xas_fetch.py). The schema also
+covers XPS, UV-Vis, Raman, FTIR, PL, XRD for later phases so adding a
+modality means adding data, not redesigning the schema.
 """
 
 from enum import Enum
@@ -11,6 +12,7 @@ from enum import Enum
 
 class Modality(str, Enum):
     XANES = "XANES"
+    XAFS = "XAFS"
     EXAFS = "EXAFS"
     XPS = "XPS"
     UV_VIS = "UV-Vis"
