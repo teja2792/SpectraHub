@@ -39,6 +39,7 @@ Usage:
 """
 
 import argparse
+import csv
 import json
 import os
 from dataclasses import dataclass, field
@@ -205,6 +206,12 @@ def fetch_all_metal_oxides(mpr, already_fetched: set) -> List[XASRecord]:
             spectrum_type = getattr(r, "spectrum_type", None)
             if spectrum_type not in DESIRED_SPECTRUM_TYPES:
                 continue
+            # mp-api/emmet hands back an enum object here, not a plain str
+            # (unlike fetch_highlighted(), which reuses a local string loop
+            # variable). Coerce to plain str now -- storing the raw enum
+            # caused validate_record() to crash later (enum.__eq__ raises
+            # ValueError when compared against "" instead of returning False).
+            spectrum_type = spectrum_type.value if hasattr(spectrum_type, "value") else str(spectrum_type)
             key = (str(r.task_id), spectrum_type)
             if key in already_fetched:
                 continue
@@ -230,10 +237,67 @@ def fetch_all_metal_oxides(mpr, already_fetched: set) -> List[XASRecord]:
     return records
 
 
+def write_summary_csv(schema_records: List[dict], out_path: Path):
+    fields = [
+        "record_id", "material_formula", "modality", "edge",
+        "absorbing_element", "mp_id", "n_points", "energy_min_eV",
+        "energy_max_eV", "is_highlighted", "source_type", "license",
+    ]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for r in schema_records:
+            x = r.get("x_values", [])
+            writer.writerow({
+                "record_id": r["record_id"],
+                "material_formula": r["material_formula"],
+                "modality": r["modality"],
+                "edge": r.get("edge"),
+                "absorbing_element": r.get("absorbing_element"),
+                "mp_id": r.get("mp_id"),
+                "n_points": len(x),
+                "energy_min_eV": min(x) if x else None,
+                "energy_max_eV": max(x) if x else None,
+                "is_highlighted": r.get("linked_properties", {}).get("is_highlighted", False),
+                "source_type": r.get("source_type"),
+                "license": r.get("license"),
+            })
+    print(f"Wrote {out_path} ({len(schema_records)} rows)")
+
+
+def plot_highlighted(records: List[XASRecord], out_path: Path):
+    import matplotlib
+    matplotlib.use("Agg")  # headless-safe; no GUI backend needed
+    import matplotlib.pyplot as plt
+
+    highlighted = [r for r in records if r.is_highlighted and r.spectrum_type == "XANES"]
+    if not highlighted:
+        print("No highlighted XANES records found -- skipping summary plot.")
+        return
+    highlighted = sorted(highlighted, key=lambda r: r.material_formula)
+    n = len(highlighted)
+    fig, axes = plt.subplots(1, n, figsize=(4 * n, 3.5))
+    if n == 1:
+        axes = [axes]
+    for ax, r in zip(axes, highlighted):
+        ax.plot(r.energy_ev, r.normalized_absorption)
+        ax.set_title(f"{r.material_formula} ({r.absorbing_element} K-edge)")
+        ax.set_xlabel("Energy (eV)")
+        ax.set_ylabel("Normalized absorption")
+    fig.suptitle("SpectraHub -- Highlighted materials, XANES (FEFF-computed, Materials Project)")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Wrote {out_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fetch FEFF-computed XAS (XANES/XAFS/EXAFS) for metal oxides.")
     parser.add_argument("--mode", choices=["highlighted", "all"], default="highlighted")
     parser.add_argument("--out", default="data/xanes")
+    parser.add_argument("--results-dir", default="results")
     parser.add_argument("--api-key", default=None)
     args = parser.parse_args()
 
@@ -249,6 +313,7 @@ def main():
 
     from schema import validate_record
     manifest = []
+    schema_records = []
     for rec in all_records:
         schema_rec = rec.to_schema_record()
         issues = validate_record(schema_rec)
@@ -257,6 +322,7 @@ def main():
         out_path = out_dir / f"{schema_rec['record_id']}.json"
         with open(out_path, "w") as f:
             json.dump(schema_rec, f, indent=2)
+        schema_records.append(schema_rec)
         manifest.append({
             "record_id": schema_rec["record_id"],
             "material_formula": rec.material_formula,
@@ -267,6 +333,9 @@ def main():
 
     with open(out_dir / "MANIFEST.json", "w") as f:
         json.dump(manifest, f, indent=2)
+
+    write_summary_csv(schema_records, out_dir / "summary.csv")
+    plot_highlighted(all_records, Path(args.results_dir) / "xas_summary.png")
 
     n_highlighted = sum(1 for r in all_records if r.is_highlighted)
     print(f"\nDone. {len(all_records)} XAS records saved to {out_dir}/ "

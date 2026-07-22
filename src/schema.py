@@ -63,6 +63,15 @@ def validate_record(record: dict) -> list:
     """Minimal dependency-free validator. Returns a list of problem
     strings; empty list means the record passes."""
     problems = []
+
+    # Defensive: some upstream values (e.g. enum types from mp-api/emmet)
+    # override __eq__ and raise ValueError instead of returning False when
+    # compared to an unrelated literal like "" (they try to coerce the
+    # literal into their own enum type first). Normalize any Enum member to
+    # its plain .value up front so every comparison below is a safe
+    # str/None/number comparison, regardless of what upstream handed us.
+    record = {k: (v.value if isinstance(v, Enum) else v) for k, v in record.items()}
+
     for key in SPECTRAL_RECORD_SCHEMA["required"]:
         if key not in record or record[key] in (None, ""):
             problems.append(f"missing required field: {key}")
