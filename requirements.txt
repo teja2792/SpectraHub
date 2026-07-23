@@ -2,3 +2,4 @@ mp-api>=0.41
 pymatgen>=2024.1.1
 matplotlib>=3.7
 sqlalchemy>=2.0
+numpy>=1.24

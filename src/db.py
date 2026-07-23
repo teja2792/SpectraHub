@@ -84,6 +84,44 @@ class MaterialLabel(Base):
     fetched_at_utc = Column(String, nullable=True)
 
 
+class SpectralFeatures(Base):
+    """Engineered numerical features per INDIVIDUAL spectrum (keyed on
+    record_id, unlike `labels` which is keyed on mp_id) -- a material with
+    XANES/XAFS/EXAFS records gets up to 3 separate feature rows, because
+    edge shape genuinely differs across those modalities, not just
+    resolution. Populated by src/feature_engineering.py (task 3).
+
+    These are inputs to the ML tasks (clustering/similarity/supervised
+    models), not raw physics -- see feature_engineering.py's module
+    docstring for the exact algorithm and its documented limitations
+    (this is a lightweight numpy implementation, not a rigorous XAS
+    analysis package like Athena/Larch)."""
+    __tablename__ = "spectral_features"
+
+    record_id = Column(String, primary_key=True)
+    edge_energy_ev = Column(Float, nullable=True)
+    edge_jump = Column(Float, nullable=True)
+    max_derivative = Column(Float, nullable=True)
+    white_line_energy_ev = Column(Float, nullable=True)
+    white_line_intensity = Column(Float, nullable=True)
+    pre_edge_energy_ev = Column(Float, nullable=True)
+    pre_edge_intensity = Column(Float, nullable=True)
+    pre_edge_margin_ev = Column(Float, nullable=True)  # how much data existed below the edge to search
+    computed_at_utc = Column(String, nullable=True)
+
+
+class SpectralCluster(Base):
+    """Unsupervised cluster assignment per XANES record, from
+    src/clustering_similarity.py (task 4). Only XANES records get
+    clustered -- see that script's module docstring for why."""
+    __tablename__ = "spectral_clusters"
+
+    record_id = Column(String, primary_key=True)
+    cluster_id = Column(Integer, nullable=False)
+    algorithm = Column(String, nullable=True)  # e.g. "kmeans k=10"
+    computed_at_utc = Column(String, nullable=True)
+
+
 def get_engine(db_path: Optional[Path] = None):
     path = db_path or DEFAULT_DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
