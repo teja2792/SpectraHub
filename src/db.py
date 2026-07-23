@@ -110,6 +110,22 @@ class SpectralFeatures(Base):
     computed_at_utc = Column(String, nullable=True)
 
 
+class ModelPrediction(Base):
+    """Leave-one-out cross-validated prediction per record, per task, from
+    src/ml_models.py (task 5). Stored per-prediction (not just aggregate
+    metrics) so results are auditable -- you can look up exactly which
+    materials the model got wrong, not just an accuracy number."""
+    __tablename__ = "model_predictions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    record_id = Column(String, nullable=False, index=True)
+    task = Column(String, nullable=False)  # "oxidation_state" | "coordination_number" | "bond_length"
+    method = Column(String, nullable=True)
+    predicted_value = Column(Float, nullable=True)
+    true_value = Column(Float, nullable=True)
+    computed_at_utc = Column(String, nullable=True)
+
+
 class SpectralCluster(Base):
     """Unsupervised cluster assignment per XANES record, from
     src/clustering_similarity.py (task 4). Only XANES records get

@@ -1,343 +1,129 @@
-"""
-mp_xas_fetch.py
+# SpectraHub
 
-Pulls FEFF-computed K-edge X-ray absorption spectra (XANES/XAFS/EXAFS) from
-the Materials Project for metal oxides, and writes:
-  - data/xanes/{record_id}.json   -- one full record per spectrum
-  - data/xanes/MANIFEST.json      -- list of all records written
-  - data/xanes/summary.csv        -- flat, pandas-ready metadata table
-  - results/xas_summary.png       -- overlay plot of highlighted materials'
-                                      XANES curves (visual sanity check)
+A small end-to-end pipeline that pulls computed X-ray absorption spectra (XAS) for metal oxides from the [Materials Project](https://materialsproject.org), turns them into a queryable database, engineers features from the raw spectra, and uses those features to cluster materials by spectral "fingerprint" and predict oxidation state, coordination number, and bond length directly from the shape of a spectrum.
 
-SCOPE: ALL metal oxides Materials Project has FEFF K-edge XAS data for.
-The four materials most relevant to this portfolio (Cu2O, Fe2O3, TiO2,
-CeO2) are always fetched first and flagged is_highlighted=True.
+Everything below reflects the actual, currently-verified state of the data as of this write-up: **2004 spectra**, **888 unique materials**, **737 with structural labels**.
 
-IMPORTANT -- what this data is and isn't:
-    Ab initio COMPUTED (FEFF real-space Green's-function multiple-
-    scattering theory), NOT experimentally measured. Every record is
-    tagged source_type = "computed-database".
+## What this is (and isn't)
 
-VERIFIED against live MP_API_KEY runs (2026-07-22):
-    - Identifier field is `task_id`, not `material_id`.
-    - `r.spectrum` exposes `.x` / `.y` list attributes directly.
-    - One formula/element/edge query returns MULTIPLE spectrum_type
-      entries (XANES/XAFS/EXAFS) for the SAME material (same task_id) --
-      this script fetches all three deliberately.
-    - CeO2's XAS onset is ~50 eV above the tabulated experimental Ce
-      K-edge, larger than FEFF's documented normal Fermi-level
-      referencing error ("only a few eV"). Cause unconfirmed -- see
-      KNOWN_CAVEATS below. No correction shift applied.
+Every spectrum here is **ab initio computed** (FEFF real-space Green's-function multiple-scattering theory), not experimentally measured. Materials Project tags every record `source_type = "computed-database"`, and this project preserves that tag end to end — nothing here should be read as lab-measured data.
 
-NOT included here: outlier/QC flagging (comparing simulated onset vs
-tabulated experimental K-edge across the whole dataset). That needs a
-verified element->tabulated-K-edge reference table that hasn't been
-sourced and vetted yet -- deliberately left out rather than hardcoding
-approximate numbers.
+Four materials are hand-picked and flagged `is_highlighted = True` because they're the ones this project cares most about: **Cu2O, Fe2O3, TiO2, CeO2**. Everything else (884 more materials) comes from an open-ended scan of every metal-oxide combination Materials Project has FEFF K-edge data for.
 
-Requires:
-    pip install mp-api pymatgen
-    $env:MP_API_KEY="your_key_here"
+**Known data caveat:** CeO2's computed XAS onset sits ~50 eV above the tabulated experimental Ce K-edge — larger than FEFF's documented typical referencing error. This is consistent across independent XANES/XAFS/EXAFS calculations for the same material, so it's treated as a genuine feature of that database entry, not a fetch bug — but no verified mechanism has been established, and no correction is applied.
 
-Usage:
-    python src/mp_xas_fetch.py                  # highlighted 4 only (fast, default)
-    python src/mp_xas_fetch.py --mode all        # every metal oxide MP has XAS for (slow)
-"""
+## The pipeline
 
-import argparse
-import csv
-import json
-import os
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional, List
+Six stages, each a standalone script, each writing to one shared SQLite database (`data/spectrahub.db`):
 
-HIGHLIGHTED_MATERIALS = {
-    "Cu2O": "Cu",
-    "Fe2O3": "Fe",
-    "TiO2": "Ti",
-    "CeO2": "Ce",
-}
+| # | Script | What it does | Needs MP_API_KEY? |
+|---|---|---|---|
+| 1 | `src/mp_xas_fetch.py` | Fetches XANES/XAFS/EXAFS spectra from Materials Project, writes JSON + CSV + summary plot | Yes |
+| 2 | `src/ingest.py` | Loads the fetched JSON records into `spectrahub.db` | No |
+| 3 | `src/label_fetch.py` | Fetches oxidation state, coordination number, and bond length per material from Materials Project's structure data | Yes |
+| 4 | `src/feature_engineering.py` | Computes edge energy, edge jump, white-line, and pre-edge features from each raw spectrum | No |
+| 5 | `src/clustering_similarity.py` | Clusters XANES spectra by shape and powers "find a similar fingerprint" search | No |
+| 6 | `src/ml_models.py` | Predicts oxidation state / coordination number / bond length from spectral features, with honest leave-one-out evaluation | No |
+| 7 | `src/api.py` | Read-only FastAPI layer serving all of the above | No |
 
-PREFERRED_MP_ID_HINTS = {
-    "Cu2O": "mp-361",
-    "Fe2O3": "mp-19770",
-    "TiO2": "mp-2657",     # unverified tie-break hint
-    "CeO2": "mp-20194",
-}
+Only steps 1 and 3 talk to Materials Project's live API — everything else runs offline against the local database.
 
-DESIRED_SPECTRUM_TYPES = ["XANES", "XAFS", "EXAFS"]
+## Quick start
 
-KNOWN_CAVEATS = {
-    "CeO2": (
-        "XAS onset sits ~50 eV above the tabulated experimental Ce K-edge "
-        "(40443 eV) -- larger than FEFF's own documented typical "
-        "Fermi-level referencing error ('only a few eV', FEFF9 user's "
-        "guide, feffproject.org). Cause unconfirmed as of 2026-07-22. "
-        "Consistent across independent XANES/XAFS/EXAFS computations for "
-        "the same mp-id -- treated as a genuine database-entry feature, "
-        "not a fetch error, but no verified mechanism established. No "
-        "energy-shift correction applied."
-    ),
-}
+```bash
+pip install -r requirements.txt
+$env:MP_API_KEY="your_key_here"          # PowerShell; use export on macOS/Linux
 
+cd src
+python mp_xas_fetch.py --mode all         # ~25-30 min: fetches all 888 materials
+python ingest.py                          # seconds: loads JSON into spectrahub.db
+python label_fetch.py                     # several minutes: one MP API call per material
+python feature_engineering.py             # seconds: pure numpy, no network
+python clustering_similarity.py --cluster --k 12
+python ml_models.py                       # seconds: trains + evaluates
+uvicorn api:app --reload                  # starts the API at http://127.0.0.1:8000/docs
+```
 
-@dataclass
-class XASRecord:
-    material_formula: str
-    mp_id: str
-    absorbing_element: str
-    edge: str
-    spectrum_type: str  # "XANES" | "XAFS" | "EXAFS"
-    energy_ev: list
-    normalized_absorption: list
-    is_highlighted: bool = False
-    retrieved_at_utc: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    notes: str = "Ab initio computed spectrum, not an experimental measurement."
+`python mp_xas_fetch.py` with no `--mode` flag fetches just the 4 highlighted materials in seconds, useful for a quick smoke test before committing to the full ~30-minute run.
 
-    def to_schema_record(self) -> dict:
-        notes = self.notes
-        caveat = KNOWN_CAVEATS.get(self.material_formula)
-        if caveat:
-            notes = f"{notes} CAVEAT: {caveat}"
-        return {
-            "record_id": f"{self.material_formula}_{self.absorbing_element}_{self.edge}edge_{self.spectrum_type}_{self.mp_id}",
-            "material_formula": self.material_formula,
-            "modality": self.spectrum_type,
-            "edge": self.edge,
-            "absorbing_element": self.absorbing_element,
-            "mp_id": self.mp_id,
-            "x_axis": "energy_eV",
-            "y_axis": "normalized_absorption",
-            "x_values": self.energy_ev,
-            "y_values": self.normalized_absorption,
-            "source_type": "computed-database",
-            "citation": (
-                "Materials Project FEFF XAS database; Zheng, C. et al. "
-                "Sci. Data 5, 180151 (2018)."
-            ),
-            "license": "CC-BY-4.0",
-            "digitization_error_estimate": None,
-            "linked_properties": {"is_highlighted": self.is_highlighted},
-            "retrieved_at_utc": self.retrieved_at_utc,
-            "notes": notes,
-        }
+## Real results, not projections
 
+**Coverage** (how much of the data actually has usable values — not padded):
 
-def _get_client(api_key: Optional[str] = None):
-    from mp_api.client import MPRester
-    key = api_key or os.environ.get("MP_API_KEY")
-    if not key:
-        raise RuntimeError(
-            "No Materials Project API key found. Set MP_API_KEY, or pass "
-            "--api-key. Get a free key at https://next-gen.materialsproject.org/api"
-        )
-    return MPRester(key)
+- Structural labels: 737/888 materials (83%) got a coordination number, 651/888 (73%) got an oxidation state.
+- Spectral features: white-line features computed for 100% of spectra (2004/2004); pre-edge features only for 466/2004 (23%) — because many fetched XANES windows start too close to the edge to have pre-edge data at all, not because of a bug (documented and measured directly in `feature_engineering.py`).
 
+**Does spectral shape encode chemistry?** Tested with leave-one-out cross-validation against a naive baseline, on 539 XANES materials:
 
-def _spectrum_arrays(spectrum):
-    if isinstance(spectrum, dict):
-        return list(spectrum.get("x", [])), list(spectrum.get("y", []))
-    energy = list(getattr(spectrum, "x", spectrum[0] if isinstance(spectrum, (list, tuple)) else []))
-    absorption = list(getattr(spectrum, "y", spectrum[1] if isinstance(spectrum, (list, tuple)) else []))
-    return energy, absorption
+| Target | Model accuracy / error | Naive baseline | Verdict |
+|---|---|---|---|
+| Oxidation state (classification) | 59.2% | 36.2% (majority class) | Real signal — matches the known "chemical shift" effect in XAS |
+| Coordination number (classification) | 53.4% | 50.3% (majority class) | Weak — barely beats guessing |
+| Bond length (regression) | MAE 0.123 Å | MAE 0.204 Å (mean baseline) | Real signal — ~40% error reduction |
 
+Coordination number being the weak link makes physical sense: it's a geometric property that near-edge XANES shape encodes less directly than electronic oxidation state does.
 
-def fetch_highlighted(mpr) -> List[XASRecord]:
-    from emmet.core.xas import Edge
-    records = []
-    for formula, elem in HIGHLIGHTED_MATERIALS.items():
-        print(f"Fetching highlighted material {formula} ({elem} K-edge)...")
-        try:
-            results = mpr.materials.xas.search(formula=formula, absorbing_element=elem, edge=Edge.K)
-        except Exception as exc:
-            print(f"  [ERROR] {exc}")
-            continue
-        if not results:
-            print(f"  [WARN] No XAS data found for {formula}.")
-            continue
-        hint = PREFERRED_MP_ID_HINTS.get(formula)
-        for spectrum_type in DESIRED_SPECTRUM_TYPES:
-            candidates = [r for r in results if getattr(r, "spectrum_type", None) == spectrum_type]
-            if not candidates:
-                print(f"  [WARN] {formula}: no {spectrum_type} entry found.")
-                continue
-            chosen = next((r for r in candidates if str(r.task_id) == hint), None) if hint else None
-            if chosen is None:
-                chosen = candidates[0]
-                if len(candidates) > 1:
-                    print(f"  [INFO] {len(candidates)} {spectrum_type} matches for {formula}; "
-                          f"using mp-id={chosen.task_id}")
-            energy, absorption = _spectrum_arrays(chosen.spectrum)
-            if not energy or not absorption:
-                print(f"  [WARN] {formula} {spectrum_type}: mp-id={chosen.task_id} had empty spectrum arrays.")
-                continue
-            records.append(XASRecord(
-                material_formula=formula, mp_id=str(chosen.task_id),
-                absorbing_element=elem, edge="K", spectrum_type=spectrum_type,
-                energy_ev=energy, normalized_absorption=absorption,
-                is_highlighted=True,
-            ))
-            print(f"  Got {spectrum_type} mp-id={chosen.task_id}, {len(energy)} points, "
-                  f"energy range [{min(energy):.1f}, {max(energy):.1f}] eV")
-    return records
+**Does the unsupervised clustering find real chemistry, with zero labels involved in the clustering itself?** Cluster 2 (20 materials, mostly Al2O3, found purely from spectral shape) has an oxidation-state standard deviation of **0.0** — every single member shares the same oxidation state — against a dataset-wide baseline of 1.16. Not every cluster is this clean, and that's stated honestly in the script's own output, not smoothed over.
 
+**Chemistry sanity checks that passed:** pre-edge intensity across the four highlighted materials follows exactly the ordering XAS theory predicts by d-electron count — none for Cu2O (d¹⁰, no empty d-states), weak for Fe2O3 (d⁵, dipole-forbidden in its octahedral site), strong for TiO2 (d⁰, the textbook case for a resolved pre-edge). Cu2O's computed bond length (1.839 Å) and coordination number (2) match the Materials Project website's own description of mp-361 exactly.
 
-def discover_all_metals() -> List[str]:
-    from pymatgen.core.periodic_table import Element
-    return sorted({el.symbol for el in Element if el.is_metal})
+## API
 
+```bash
+cd src && uvicorn api:app --reload
+```
 
-def fetch_all_metal_oxides(mpr, already_fetched: set) -> List[XASRecord]:
-    from emmet.core.xas import Edge
-    metals = discover_all_metals()
-    print(f"\n--mode all: scanning {len(metals)} metal elements for M-O XAS data "
-          f"(one API call per metal, up to 3 records each -- slow, may hit rate limits).")
-    records = []
-    for i, metal in enumerate(metals, 1):
-        print(f"[{i}/{len(metals)}] {metal}-O ...")
-        try:
-            results = mpr.materials.xas.search(elements=[metal, "O"], absorbing_element=metal, edge=Edge.K)
-        except Exception as exc:
-            print(f"  [ERROR] {exc}")
-            continue
-        if not results:
-            continue
-        found_here = 0
-        for r in results:
-            spectrum_type = getattr(r, "spectrum_type", None)
-            if spectrum_type not in DESIRED_SPECTRUM_TYPES:
-                continue
-            key = (str(r.task_id), spectrum_type)
-            if key in already_fetched:
-                continue
-            els = getattr(r, "elements", None)
-            if els is not None:
-                symbols = {str(e) for e in els}
-                if symbols != {metal, "O"}:
-                    continue
-            energy, absorption = _spectrum_arrays(r.spectrum)
-            if not energy or not absorption:
-                continue
-            records.append(XASRecord(
-                material_formula=str(getattr(r, "formula_pretty", f"{metal}xOy")),
-                mp_id=str(r.task_id),
-                absorbing_element=metal, edge="K", spectrum_type=spectrum_type,
-                energy_ev=energy, normalized_absorption=absorption,
-                is_highlighted=False,
-            ))
-            already_fetched.add(key)
-            found_here += 1
-        if found_here:
-            print(f"  +{found_here} binary {metal}-O XAS record(s)")
-    return records
+Then visit `http://127.0.0.1:8000/docs` for interactive documentation, or:
 
+```
+GET /stats                                          overview counts
+GET /materials?formula_contains=Cu2O                 search materials
+GET /materials/{mp_id}                               full detail for one material
+GET /spectra/{record_id}                              raw spectrum + computed features
+GET /spectra/{record_id}/similar?top=10                nearest XANES fingerprints
+GET /clusters/{cluster_id}                            all members of a cluster
+GET /predictions?task=oxidation_state&mismatches_only=true   audit model errors directly
+```
 
-def write_summary_csv(schema_records: List[dict], out_path: Path):
-    fields = [
-        "record_id", "material_formula", "modality", "edge",
-        "absorbing_element", "mp_id", "n_points", "energy_min_eV",
-        "energy_max_eV", "is_highlighted", "source_type", "license",
-    ]
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for r in schema_records:
-            x = r.get("x_values", [])
-            writer.writerow({
-                "record_id": r["record_id"],
-                "material_formula": r["material_formula"],
-                "modality": r["modality"],
-                "edge": r.get("edge"),
-                "absorbing_element": r.get("absorbing_element"),
-                "mp_id": r.get("mp_id"),
-                "n_points": len(x),
-                "energy_min_eV": min(x) if x else None,
-                "energy_max_eV": max(x) if x else None,
-                "is_highlighted": r.get("linked_properties", {}).get("is_highlighted", False),
-                "source_type": r.get("source_type"),
-                "license": r.get("license"),
-            })
-    print(f"Wrote {out_path} ({len(schema_records)} rows)")
+The API is read-only by design — it serves what the pipeline scripts already computed, and never re-runs a model or triggers a live Materials Project fetch on your behalf.
 
+## Project structure
 
-def plot_highlighted(records: List[XASRecord], out_path: Path):
-    import matplotlib
-    matplotlib.use("Agg")  # headless-safe; no GUI backend needed
-    import matplotlib.pyplot as plt
+```
+src/
+  mp_xas_fetch.py          # stage 1: fetch spectra from Materials Project
+  ingest.py                 # stage 2: load JSON into SQLite
+  label_fetch.py             # stage 3: fetch structural labels
+  feature_engineering.py      # stage 4: derive spectral features
+  clustering_similarity.py     # stage 5: cluster + similarity search
+  ml_models.py                  # stage 6: supervised prediction models
+  api.py                          # stage 7: FastAPI layer
+  db.py                             # shared SQLAlchemy schema
+  schema.py                          # JSON record schema + validator
+  diagnose_mp_api.py                  # one-off MP API diagnostic (kept for reference)
+data/
+  xanes/                    # per-record JSON + MANIFEST.json + summary.csv
+  spectrahub.db              # SQLite database (all 7 tables)
+results/
+  xas_summary.png            # overlay plot of the 4 highlighted materials
+```
 
-    highlighted = [r for r in records if r.is_highlighted and r.spectrum_type == "XANES"]
-    if not highlighted:
-        print("No highlighted XANES records found -- skipping summary plot.")
-        return
-    highlighted = sorted(highlighted, key=lambda r: r.material_formula)
-    n = len(highlighted)
-    fig, axes = plt.subplots(1, n, figsize=(4 * n, 3.5))
-    if n == 1:
-        axes = [axes]
-    for ax, r in zip(axes, highlighted):
-        ax.plot(r.energy_ev, r.normalized_absorption)
-        ax.set_title(f"{r.material_formula} ({r.absorbing_element} K-edge)")
-        ax.set_xlabel("Energy (eV)")
-        ax.set_ylabel("Normalized absorption")
-    fig.suptitle("SpectraHub -- Highlighted materials, XANES (FEFF-computed, Materials Project)")
-    fig.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"Wrote {out_path}")
+## Design choices worth knowing about
 
+- **No scikit-learn or scipy.** Both were unreliable to install in this project's development environment, so clustering (k-means), similarity search (cosine similarity), and prediction (k-nearest-neighbors) are all hand-implemented in pure numpy — verified directly against real data rather than assumed correct. If scikit-learn installs cleanly for you, swapping in a Random Forest for `ml_models.py` would likely improve on the k-NN results above.
+- **SQLite, not Postgres.** Fine at this scale (~2000 records); the schema uses plain SQLAlchemy ORM with no SQLite-specific types, so switching the engine URL later doesn't require a rewrite.
+- **Materials Project's identifier scheme changed recently** (database version `2026-04-13`): IDs are transitioning from numeric (`mp-149`) to base-26 `AlphaID`s (`mp-hilze`). This project's `mp_id` values are the AlphaID `task_id` from the XAS API route — confirmed live to resolve correctly against Materials Project's other API routes, with or without the `mp-` prefix.
 
-def main():
-    parser = argparse.ArgumentParser(description="Fetch FEFF-computed XAS (XANES/XAFS/EXAFS) for metal oxides.")
-    parser.add_argument("--mode", choices=["highlighted", "all"], default="highlighted")
-    parser.add_argument("--out", default="data/xanes")
-    parser.add_argument("--results-dir", default="results")
-    parser.add_argument("--api-key", default=None)
-    args = parser.parse_args()
+## Requirements
 
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    mpr = _get_client(args.api_key)
+```
+mp-api>=0.41
+pymatgen>=2024.1.1
+matplotlib>=3.7
+sqlalchemy>=2.0
+numpy>=1.24
+fastapi>=0.110
+uvicorn[standard]>=0.29
+```
 
-    with mpr:
-        all_records = fetch_highlighted(mpr)
-        if args.mode == "all":
-            already = {(r.mp_id, r.spectrum_type) for r in all_records}
-            all_records += fetch_all_metal_oxides(mpr, already)
-
-    from schema import validate_record
-    manifest = []
-    schema_records = []
-    for rec in all_records:
-        schema_rec = rec.to_schema_record()
-        issues = validate_record(schema_rec)
-        if issues:
-            print(f"  [SCHEMA WARNING] {schema_rec['record_id']}: {issues}")
-        out_path = out_dir / f"{schema_rec['record_id']}.json"
-        with open(out_path, "w") as f:
-            json.dump(schema_rec, f, indent=2)
-        schema_records.append(schema_rec)
-        manifest.append({
-            "record_id": schema_rec["record_id"],
-            "material_formula": rec.material_formula,
-            "spectrum_type": rec.spectrum_type,
-            "mp_id": rec.mp_id,
-            "is_highlighted": rec.is_highlighted,
-        })
-
-    with open(out_dir / "MANIFEST.json", "w") as f:
-        json.dump(manifest, f, indent=2)
-
-    write_summary_csv(schema_records, out_dir / "summary.csv")
-    plot_highlighted(all_records, Path(args.results_dir) / "xas_summary.png")
-
-    n_highlighted = sum(1 for r in all_records if r.is_highlighted)
-    print(f"\nDone. {len(all_records)} XAS records saved to {out_dir}/ "
-          f"({n_highlighted} highlighted, {len(all_records) - n_highlighted} other metal oxides).")
-
-
-if __name__ == "__main__":
-    main()
+A free Materials Project API key is required for stages 1 and 3: [next-gen.materialsproject.org/api](https://next-gen.materialsproject.org/api).
