@@ -1,16 +1,22 @@
 """
 diagnose_mp_api.py
 
-One-off diagnostic. Every mp_id currently in data/xanes/*.json is an
-8-character all-lowercase string (e.g. "aaaaaanx"). Real Materials Project
-IDs are always "mp-<integer>" -- verified live on next-gen.materialsproject.org
-that mp-361 is genuinely Cu2O. That means either the fetch that produced
-data/xanes/ wasn't really hitting the live MP API, or something between
-the API response and the JSON files on disk is mangling task_id.
+One-off diagnostic, resolved: every mp_id in data/xanes/*.json is an
+8-character all-lowercase AlphaID (e.g. "aaaaaanx"). This is real MP data
+-- as of database version 2026-04-13, Materials Project switched new
+materials/tasks from numeric MPIDs ("mp-149") to base-26 AlphaIDs
+("mp-hilze") to stop conflating the material_id and task_id namespaces
+(docs.materialsproject.org/data-production/identifiers). Confirmed live:
+mp-361 resolves to real Cu2O on both the website and the summary API route.
 
-This script prints exactly what the live API hands back, before any of
-mp_xas_fetch.py's own code touches it, so we can see where -- if anywhere
--- the ID format diverges from "mp-<integer>".
+Open question this section 4 answers: the canonical AlphaID format per
+MP's docs includes an "mp-" prefix (AlphaID(mp-hilze)), but task_id from
+the XAS route prints WITHOUT one (AlphaID(aaaaaanx)) -- and the docs say
+MP is now deliberately distinguishing material_id from task_id, which
+used to be identical. mp_xas_fetch.py has been storing task_id as mp_id.
+Section 4 checks whether that value (with or without "mp-" prepended) or
+a separate material_id field actually resolves on the material-level
+routes (summary, oxidation_states) that src/label_fetch.py will depend on.
 
 Usage:
     python src/diagnose_mp_api.py
@@ -65,13 +71,44 @@ try:
             r = results[0]
             print(f"  task_id: {r.task_id!r}  (type: {type(r.task_id).__name__})")
             print(f"  spectrum_type: {r.spectrum_type!r}  (type: {type(r.spectrum_type).__name__})")
+            material_id = getattr(r, "material_id", None)
+            print(f"  material_id attr on XAS result: {material_id!r}")
+
             print()
-            if str(r.task_id).startswith("mp-"):
-                print("  ==> Real Materials Project ID. Problem is DOWNSTREAM of the API call --")
-                print("      i.e. data/xanes/*.json was not produced by a clean run of the current script.")
-            else:
-                print("  ==> NOT a real Materials Project ID format. Problem is UPSTREAM --")
-                print("      in the installed package or account, not in mp_xas_fetch.py's logic.")
+            print("=== 4. Does task_id resolve as a material_id on the summary/oxidation_states routes? ===")
+            # Per MP's own docs (docs.materialsproject.org/data-production/identifiers),
+            # AlphaIDs and MPIDs should be cross-queryable. task_id from the XAS route
+            # printed WITHOUT an "mp-" prefix above -- try it both ways.
+            candidates_to_try = []
+            raw_task_id = str(r.task_id)
+            candidates_to_try.append(raw_task_id)
+            if not raw_task_id.startswith("mp-"):
+                candidates_to_try.append(f"mp-{raw_task_id}")
+            if material_id:
+                candidates_to_try.append(str(material_id))
+
+            for candidate in dict.fromkeys(candidates_to_try):  # dedupe, keep order
+                print(f"  Trying material_ids=[{candidate!r}] on materials.summary.search ...")
+                try:
+                    hit = mpr.materials.summary.search(
+                        material_ids=[candidate], fields=["material_id", "formula_pretty"]
+                    )
+                    if hit:
+                        print(f"    SUCCESS: material_id={hit[0].material_id!r} formula_pretty={hit[0].formula_pretty!r}")
+                    else:
+                        print("    no results (query ran, but returned empty)")
+                except Exception as exc:
+                    print(f"    FAILED: {type(exc).__name__}: {exc}")
+
+                print(f"  Trying material_ids=[{candidate!r}] on materials.oxidation_states.search ...")
+                try:
+                    hit = mpr.materials.oxidation_states.search(material_ids=[candidate])
+                    if hit:
+                        print(f"    SUCCESS: average_oxidation_states={hit[0].average_oxidation_states!r}")
+                    else:
+                        print("    no results (query ran, but returned empty)")
+                except Exception as exc:
+                    print(f"    FAILED: {type(exc).__name__}: {exc}")
 except Exception as exc:
     print(f"  [ERROR] {type(exc).__name__}: {exc}")
     print("  Paste this full error back too -- it's diagnostic either way.")
