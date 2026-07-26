@@ -27,6 +27,13 @@ class SourceType(str, Enum):
     DEPOSITED_RAW = "deposited-raw-file"
     DIGITIZED_FIGURE = "digitized-from-figure"
     OWN_PUBLISHED_PAPER = "own-published-paper"
+    # The two below exist so records imported from SpectraVault (see
+    # src/import_spectravault.py) validate against THIS schema unchanged,
+    # rather than needing a lossy remap at the import boundary. Keep these
+    # in sync with SpectraVault's own SourceType (src/schema.py there) if
+    # either project adds a new source category.
+    OPEN_DATABASE = "open-database"                        # e.g. RRUFF, NIST -- curated public database
+    HAND_DIGITIZED_BY_CURATOR = "hand-digitized-by-curator"  # manually traced from a figure
 
 
 SPECTRAL_RECORD_SCHEMA = {
@@ -82,9 +89,9 @@ def validate_record(record: dict) -> list:
     if record.get("source_type") not in [s.value for s in SourceType]:
         problems.append(f"invalid source_type: {record.get('source_type')!r}")
 
-    if record.get("source_type") == SourceType.DIGITIZED_FIGURE.value:
+    if record.get("source_type") in (SourceType.DIGITIZED_FIGURE.value, SourceType.HAND_DIGITIZED_BY_CURATOR.value):
         if record.get("digitization_error_estimate") is None:
-            problems.append("digitized-from-figure records must set digitization_error_estimate")
+            problems.append(f"{record.get('source_type')} records must set digitization_error_estimate")
 
     if record.get("source_type") == SourceType.COMPUTED_DATABASE.value and not record.get("mp_id"):
         problems.append("computed-database records should carry an mp_id for traceability")
