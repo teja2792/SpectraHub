@@ -47,6 +47,15 @@ both point to as "how the connection actually works"):
 Usage:
     python src/import_spectravault.py --vault-path ../SpectraVault
     python src/import_spectravault.py --vault-path ../SpectraVault --min-confidence 0.5
+    python src/import_spectravault.py --vault-path ../SpectraVault --offset 0 --limit 500
+
+--offset/--limit scan only a slice of the vault's manifest -- added once
+SpectraVault's vault grew past ~2,000 records (RRUFF XRD + infrared),
+where reading every record file individually over a network-mounted
+folder plus the DB upsert can outrun a single shell command's timeout.
+Each invocation still commits what it processed, so running this a few
+times with increasing --offset covers the whole vault; rerunning any
+slice is safe since load_record() upserts by record_id.
 """
 
 import argparse
@@ -110,11 +119,19 @@ def main():
     parser.add_argument("--db", default=None, help="Path to SQLite file (default: data/spectrahub.db)")
     parser.add_argument("--min-confidence", type=float, default=0.0,
                          help="Skip vault records below this confidence_score (default: 0.0, import everything).")
+    parser.add_argument("--offset", type=int, default=0)
+    parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
     vault_path = Path(args.vault_path).resolve()
     manifest = load_vault_manifest(vault_path)
     vault_commit = _vault_git_commit(vault_path)
+
+    total = len(manifest)
+    manifest = manifest[args.offset:(args.offset + args.limit) if args.limit else None]
+    if args.offset or args.limit:
+        print(f"{total} manifest entries total; processing slice "
+              f"[{args.offset}:{args.offset + len(manifest)}]")
 
     session = get_session(Path(args.db) if args.db else None)
 
